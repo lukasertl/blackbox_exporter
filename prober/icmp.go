@@ -14,19 +14,16 @@
 package prober
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"math/rand"
 	"net"
-	"runtime"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 
 	"github.com/prometheus/blackbox_exporter/config"
 )
@@ -60,21 +57,13 @@ func getICMPSequence() uint16 {
 
 func ProbeICMP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (success bool) {
 	var (
-		requestType     icmp.Type
-		replyType       icmp.Type
-		icmpConn        *icmp.PacketConn
-		v4RawConn       *ipv4.RawConn
-		hopLimitFlagSet = true
+		requestType icmp.Type
+		icmpConn    *icmp.PacketConn
 
 		durationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "probe_icmp_duration_seconds",
 			Help: "Duration of icmp request by phase",
 		}, []string{"phase"})
-
-		hopLimitGauge = prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "probe_icmp_reply_hop_limit",
-			Help: "Replied packet hop limit (TTL for ipv4)",
-		})
 	)
 
 	for _, lv := range []string{"resolve", "setup", "rtt"} {
@@ -102,100 +91,20 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 	setupStart := time.Now()
 	logger.Debug("Creating socket")
 
-	privileged := true
-	// Unprivileged sockets are supported on Darwin and Linux only.
-	tryUnprivileged := runtime.GOOS == "darwin" || runtime.GOOS == "linux"
+	requestType = ipv4.ICMPTypeEcho
 
-	if dstIPAddr.IP.To4() == nil {
-		requestType = ipv6.ICMPTypeEchoRequest
-		replyType = ipv6.ICMPTypeEchoReply
-
-		if srcIP == nil {
-			srcIP = net.ParseIP("::")
-		}
-
-		if tryUnprivileged {
-			// "udp" here means unprivileged -- not the protocol "udp".
-			icmpConn, err = icmp.ListenPacket("udp6", srcIP.String())
-			if err != nil {
-				logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
-			} else {
-				privileged = false
-			}
-		}
-
-		if privileged {
-			icmpConn, err = icmp.ListenPacket("ip6:ipv6-icmp", srcIP.String())
-			if err != nil {
-				logger.Error("Error listening to socket", "err", err)
-				return
-			}
-		}
-		defer icmpConn.Close()
-
-		if err := icmpConn.IPv6PacketConn().SetControlMessage(ipv6.FlagHopLimit, true); err != nil {
-			logger.Debug("Failed to set Control Message for retrieving Hop Limit", "err", err)
-			hopLimitFlagSet = false
-		}
-	} else {
-		requestType = ipv4.ICMPTypeEcho
-		replyType = ipv4.ICMPTypeEchoReply
-
-		if srcIP == nil {
-			srcIP = net.ParseIP("0.0.0.0")
-		}
-
-		if module.ICMP.DontFragment {
-			// If the user has set the don't fragment option we cannot use unprivileged
-			// sockets as it is not possible to set IP header level options.
-			netConn, err := net.ListenPacket("ip4:icmp", srcIP.String())
-			if err != nil {
-				logger.Error("Error listening to socket", "err", err)
-				return
-			}
-			defer netConn.Close()
-
-			v4RawConn, err = ipv4.NewRawConn(netConn)
-			if err != nil {
-				logger.Error("Error creating raw connection", "err", err)
-				return
-			}
-			defer v4RawConn.Close()
-
-			if err := v4RawConn.SetControlMessage(ipv4.FlagTTL, true); err != nil {
-				logger.Debug("Failed to set Control Message for retrieving TTL", "err", err)
-				hopLimitFlagSet = false
-			}
-		} else {
-			if tryUnprivileged {
-				icmpConn, err = icmp.ListenPacket("udp4", srcIP.String())
-				if err != nil {
-					logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
-				} else {
-					privileged = false
-				}
-			}
-
-			if privileged {
-				icmpConn, err = icmp.ListenPacket("ip4:icmp", srcIP.String())
-				if err != nil {
-					logger.Error("Error listening to socket", "err", err)
-					return
-				}
-			}
-			defer icmpConn.Close()
-
-			if err := icmpConn.IPv4PacketConn().SetControlMessage(ipv4.FlagTTL, true); err != nil {
-				logger.Debug("Failed to set Control Message for retrieving TTL", "err", err)
-				hopLimitFlagSet = false
-			}
-		}
+	if srcIP == nil {
+		srcIP = net.ParseIP("0.0.0.0")
 	}
+
+	icmpConn, err = icmp.ListenPacket("udp4", srcIP.String())
+	if err != nil {
+		logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
+	}
+	defer icmpConn.Close()
 
 	var dst net.Addr = dstIPAddr
-	if !privileged {
-		dst = &net.UDPAddr{IP: dstIPAddr.IP, Zone: dstIPAddr.Zone}
-	}
+	dst = &net.UDPAddr{IP: dstIPAddr.IP, Zone: dstIPAddr.Zone}
 
 	var data []byte
 	if module.ICMP.PayloadSize != 0 {
@@ -224,106 +133,33 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 	}
 
 	durationGaugeVec.WithLabelValues("setup").Add(time.Since(setupStart).Seconds())
-	logger.Debug("Writing out packet")
 
 	rb := make([]byte, 65536)
 	deadline, _ := ctx.Deadline()
 	var rttStart time.Time
 
-	if icmpConn != nil {
-		ttl := module.ICMP.TTL
-		if ttl > 0 {
-			if c4 := icmpConn.IPv4PacketConn(); c4 != nil {
-				logger.Debug("Setting TTL (IPv4 unprivileged)", "ttl", ttl)
-				c4.SetTTL(ttl)
-			}
-			if c6 := icmpConn.IPv6PacketConn(); c6 != nil {
-				logger.Debug("Setting TTL (IPv6 unprivileged)", "ttl", ttl)
-				c6.SetHopLimit(ttl)
-			}
-		}
-		err = icmpConn.SetReadDeadline(deadline)
-		if err != nil {
-			logger.Error("Error setting socket deadline", "err", err)
-			return
-		}
-
-		rttStart = time.Now()
-		_, err = icmpConn.WriteTo(wb, dst)
-	} else {
-		ttl := config.DefaultICMPTTL
-		if module.ICMP.TTL > 0 {
-			logger.Debug("Overriding TTL (raw IPv4)", "ttl", ttl)
-			ttl = module.ICMP.TTL
-		}
-		// Only for IPv4 raw. Needed for setting DontFragment flag.
-		header := &ipv4.Header{
-			Version:  ipv4.Version,
-			Len:      ipv4.HeaderLen,
-			Protocol: 1,
-			TotalLen: ipv4.HeaderLen + len(wb),
-			TTL:      ttl,
-			Dst:      dstIPAddr.IP,
-			Src:      srcIP,
-		}
-
-		header.Flags |= ipv4.DontFragment
-
-		err = v4RawConn.SetReadDeadline(deadline)
-		if err != nil {
-			logger.Error("Error setting socket deadline", "err", err)
-			return
-		}
-
-		rttStart = time.Now()
-		err = v4RawConn.WriteTo(header, wb, nil)
+	err = icmpConn.SetReadDeadline(deadline)
+	if err != nil {
+		logger.Error("Error setting socket deadline", "err", err)
+		return
 	}
+
+	logger.Debug("Writing out packet")
+	rttStart = time.Now()
+	_, err = icmpConn.WriteTo(wb, dst)
 	if err != nil {
 		logger.Warn("Error writing to socket", "err", err)
 		return
 	}
 
-	// log.Printf("time wasted: %f (%s)\n", time.Since(rttStart).Seconds(), target)
 	logger.Debug("Waiting for reply packets")
 	for {
-		var n int
 		var peer net.Addr
 		var err error
-		var hopLimit float64 = -1
 		var rtt float64
 
-		if dstIPAddr.IP.To4() == nil {
-			var cm *ipv6.ControlMessage
-			n, cm, peer, err = icmpConn.IPv6PacketConn().ReadFrom(rb)
-			// HopLimit == 0 is valid for IPv6, although go initialize it as 0.
-			if cm != nil && hopLimitFlagSet {
-				hopLimit = float64(cm.HopLimit)
-			} else {
-				logger.Debug("Cannot get Hop Limit from the received packet. 'probe_icmp_reply_hop_limit' will be missing.")
-			}
-			rtt = time.Since(rttStart).Seconds()
-		} else {
-			var cm *ipv4.ControlMessage
-			if icmpConn != nil {
-				n, cm, peer, err = icmpConn.IPv4PacketConn().ReadFrom(rb)
-			} else {
-				var h *ipv4.Header
-				var p []byte
-				h, p, cm, err = v4RawConn.ReadFrom(rb)
-				if err == nil {
-					copy(rb, p)
-					n = len(p)
-					peer = &net.IPAddr{IP: h.Src}
-				}
-			}
-			rtt = time.Since(rttStart).Seconds()
-			if cm != nil && hopLimitFlagSet {
-				// Not really Hop Limit, but it is in practice.
-				hopLimit = float64(cm.TTL)
-			} else {
-				logger.Debug("Cannot get TTL from the received packet. 'probe_icmp_reply_hop_limit' will be missing.")
-			}
-		}
+		_, peer, err = icmpConn.ReadFrom(rb)
+		rtt = time.Since(rttStart).Seconds()
 		if err != nil {
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
 				logger.Warn("Timeout reading from socket", "err", err)
@@ -335,45 +171,16 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		if peer.String() != dst.String() {
 			continue
 		}
-		// Unprivileged cannot set IDs on Linux.
-		idUnknown := !privileged && runtime.GOOS == "linux"
-		if idUnknown {
-			// Clear the ID from the packet, as the kernel will have replaced it (and
-			// kept track of our packet for us, hence clearing is safe).
-			rb[4] = 0
-			rb[5] = 0
-		}
-		if idUnknown || replyType == ipv6.ICMPTypeEchoReply {
-			// Clear checksum to make comparison succeed.
-			rb[2] = 0
-			rb[3] = 0
-		}
+
 		// Reply should be the same except for the message type and ID if
 		// unprivileged sockets were used and the kernel used its own.
-		wm.Type = replyType
-		if idUnknown {
-			body.ID = 0
-		}
-		wb, err = wm.Marshal(nil)
 		if err != nil {
 			logger.Error("Error marshalling packet", "err", err)
 			return
 		}
 
-		if idUnknown {
-			// If the ID is unknown (due to unprivileged sockets) we also cannot know
-			// the checksum in userspace.
-			wb[2] = 0
-			wb[3] = 0
-		}
-		if bytes.Equal(rb[:n], wb) {
-			durationGaugeVec.WithLabelValues("rtt").Add(rtt)
-			if hopLimit >= 0 {
-				hopLimitGauge.Set(hopLimit)
-				registry.MustRegister(hopLimitGauge)
-			}
-			logger.Debug("Found matching reply packet")
-			return true
-		}
+		durationGaugeVec.WithLabelValues("rtt").Add(rtt)
+		logger.Debug("Found matching reply packet")
+		return true
 	}
 }
